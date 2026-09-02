@@ -107,6 +107,30 @@ window.fetch = async function (resource, options) {
     });
   }
 
+  // Emscripten grows the heap to max(requested, oldSize * 1.2), overshooting by
+  // 20% of the current heap each time: +189 MB at 1 GB, +291 MB at 1.5 GB. A 5%
+  // factor and a 64 MB cap make that +35 MB and +61 MB. Growth is in-place here
+  // because the module declares a maximum, so extra steps cost little.
+  //
+  // The two edits cancel out in length, so the body is byte-for-byte the same
+  // size and the original headers still describe it. An earlier attempt built a
+  // fresh Response without them, and the missing Content-Length stalled the
+  // loader at 90%.
+  if (TUNE === "all" && url && url.includes("framework.js")) {
+    const r = await originalFetch(resource, options);
+    if (!r.ok) return r;
+    const js = await r.text();
+    const patched = js
+      .replace("1 + .2 / cutDown", "1 + .05 / cutDown")
+      .replace("requestedSize + 536870912", "requestedSize + 67108864");
+    if (patched === js || patched.length !== js.length) {
+      console.warn("heap growth patch did not apply cleanly; running unmodified");
+      return new Response(js, { headers: r.headers });
+    }
+    console.log("heap growth tightened: 20% overshoot -> 5%");
+    return new Response(patched, { headers: r.headers });
+  }
+
   return originalFetch(resource, options);
 };
 
@@ -297,6 +321,44 @@ async function unpack() {
   console.log(`Unpack complete: ${count} bundles, ${src.read} bytes read`);
 }
 
+/* ================= HEAP TELEMETRY =================
+   The tab dies before anything can be read off the console, so the peak is
+   written to localStorage as it climbs and reported on the next load. This is
+   the number that says whether the heap can be tuned into range at all, or
+   whether the machine simply does not have the memory. */
+
+const HEAP_PEAK_KEY = "silksong-heap-peak-mb";
+
+function reportLastRun() {
+  const last = localStorage.getItem(HEAP_PEAK_KEY);
+  if (last) {
+    console.log(`Previous run reached a ${last} MB wasm heap before stopping.`);
+  }
+  if (navigator.deviceMemory) {
+    console.log(`This device reports roughly ${navigator.deviceMemory} GB of RAM.`);
+  }
+}
+
+function watchHeap(instance) {
+  const readout = document.createElement("div");
+  readout.style.cssText =
+    "position:fixed;top:4px;right:6px;z-index:99;font:12px monospace;" +
+    "color:#8f8;background:rgba(0,0,0,.55);padding:2px 6px;border-radius:3px";
+  document.body.appendChild(readout);
+
+  let peak = 0;
+  setInterval(() => {
+    const heap = instance?.Module?.HEAPU8?.length;
+    if (!heap) return;
+    const mb = Math.round(heap / 1048576);
+    if (mb > peak) {
+      peak = mb;
+      localStorage.setItem(HEAP_PEAK_KEY, String(peak));
+    }
+    readout.textContent = `heap ${mb} MB (peak ${peak})`;
+  }, 500);
+}
+
 /* ================= UNITY ================= */
 function startUnity() {
   const canvas = document.querySelector("#unity-canvas");
@@ -344,7 +406,7 @@ function startUnity() {
       progressBarFull.style.width = (progress * 100) + "%";
       say("LOADING... " + Math.round(progress * 100) + "%");
     })
-      .then(() => { loadingBar.remove(); loadingText.remove(); })
+      .then((instance) => { loadingBar.remove(); loadingText.remove(); watchHeap(instance); })
       .catch((err) => { console.error(err); say("ERROR: " + err); });
   };
   script.onerror = () => say("ERROR: could not load " + script.src);
@@ -354,6 +416,7 @@ function startUnity() {
 /* ================= MAIN ================= */
 (async () => {
   try {
+    reportLastRun();
     await dropOldCaches();
 
     // Ask Chrome not to evict the unpacked bundles under storage pressure -
