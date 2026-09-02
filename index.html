@@ -93,6 +93,19 @@ const MAX_CONCURRENT_BUNDLE_LOADS = 1;
 // outright on a machine that cannot hand over 2688 MB in a single request.
 const PREALLOCATE = new URLSearchParams(location.search).get("heap") === "pre";
 
+// &audio=none swaps the four audio bundles for copies under StreamingAssets/aa/
+// silent. Those are the same bundles with every AudioClip's resource pointer
+// zeroed and the audio blob emptied - 402 MB becomes 0.78 MB - so Addressables
+// still finds every clip and dependency it expects and the bundles load
+// normally. Deleting them instead is fatal: a missing bundle fails the whole
+// dependency group and the title screen never loads.
+// Bump when catalog.bin changes, to get past the CDN's week-long cache.
+const CATALOG_VERSION = "2";
+
+const SILENT_AUDIO = new URLSearchParams(location.search).get("audio") === "none";
+const AUDIO_BUNDLES = ["packed-audio-hornetmusic", "packed-audio-hornetvoices",
+                       "packed-audio-sfx", "packed-audio-voices"];
+
 const LOADED_KEY = "silksong-bundles-loaded";
 const loadedBundles = [];
 
@@ -109,6 +122,10 @@ window.fetch = async function (resource, options) {
   // Unity asks for bundles by their plain filename; serve the unpacked copies.
   if (url && url.includes(".bundle")) {
     const name = url.split("/").pop().split("?")[0];
+    if (SILENT_AUDIO && AUDIO_BUNDLES.some(b => name.startsWith(b))) {
+      console.log("silent audio: " + name.slice(0, 40));
+      return originalFetch("StreamingAssets/aa/silent/" + name);
+    }
     const hit = await (await getCache()).match(name);
     if (hit) {
       // Every bundle Unity loads passes through here. Recording them says
@@ -127,6 +144,15 @@ window.fetch = async function (resource, options) {
     if (!r.ok) return r;
     const cfg = await r.json();
     cfg.m_maxConcurrentWebRequests = MAX_CONCURRENT_BUNDLE_LOADS;
+
+    // catalog.bin is served with max-age=604800, so an edited copy would not
+    // reach a browser that already has one for a week. Addressables builds the
+    // catalog URL from this field, so pointing it somewhere new fetches afresh.
+    for (const loc of cfg.m_CatalogLocations || []) {
+      if (typeof loc.m_InternalId === "string" && loc.m_InternalId.includes("catalog.bin")) {
+        loc.m_InternalId += "?cv=" + CATALOG_VERSION;
+      }
+    }
     const body = new TextEncoder().encode(JSON.stringify(cfg));
     console.log(`Addressables concurrency set to ${MAX_CONCURRENT_BUNDLE_LOADS}`);
     // Unity reads Content-Length off these responses and stalls its progress
