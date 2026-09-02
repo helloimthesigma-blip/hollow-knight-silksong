@@ -32,7 +32,7 @@
   and got the renderer killed (Chrome "Aw, Snap!", error code 9).
 */
 
-const CACHE_NAME = "hksilksongcache-v3";
+const CACHE_NAME = "hksilksongcache-v4";
 const ZIP_PARTS = 100;
 const ZIP_BASE = "StreamingAssets/aa/WebGL.zip";
 
@@ -73,94 +73,39 @@ async function dropOldCaches() {
   }
 }
 
-/* ================= SPLIT-FILE READER =================
-   Presents the 100 parts as one addressable byte range, fetching only the
-   slices actually asked for. */
-class SplitZip {
-  async open() {
-    const sizes = [];
-    for (let i = 0; i < ZIP_PARTS; i += 10) {
-      const batch = [];
-      for (let j = i; j < Math.min(i + 10, ZIP_PARTS); j++) {
-        batch.push(originalFetch(`${ZIP_BASE}.part${j + 1}`, { method: "HEAD" })
-          .then(r => {
-            if (!r.ok) throw new Error(`HEAD part${j + 1}: ${r.status}`);
-            return [j, +r.headers.get("Content-Length")];
-          }));
-      }
-      for (const [j, len] of await Promise.all(batch)) sizes[j] = len;
-    }
-    this.sizes = sizes;
-    this.offsets = [];
-    let t = 0;
-    for (const s of sizes) { this.offsets.push(t); t += s; }
-    this.size = t;
-    return this;
-  }
+/* ================= ZIP =================
+   GitHub Pages re-compresses these files for any browser (which always sends
+   Accept-Encoding: gzip), so Content-Length and Range offsets both describe
+   the *compressed* stream while fetch hands back decompressed bytes. Byte
+   ranges are therefore meaningless over the network, and Accept-Encoding is a
+   forbidden header so it can't be turned off.
 
-  /* Which parts cover global bytes [start, end), and which slice of each. */
-  planRange(start, end) {
-    const plan = [];
-    for (let i = 0; i < this.sizes.length; i++) {
-      const ps = this.offsets[i], pe = ps + this.sizes[i];
-      if (pe <= start || ps >= end) continue;
-      plan.push({
-        part: i + 1,
-        from: Math.max(start, ps) - ps,
-        to: Math.min(end, pe) - ps - 1,
-      });
-    }
-    return plan;
+   Instead each part is downloaded whole into a Blob. Chrome keeps Blobs in its
+   own storage rather than the JS heap, so this stays cheap, and slicing a Blob
+   is a local operation with none of the header trouble. */
+async function downloadZip() {
+  const parts = [];
+  let bytes = 0;
+  for (let i = 1; i <= ZIP_PARTS; i++) {
+    const r = await originalFetch(`${ZIP_BASE}.part${i}`);
+    if (!r.ok) throw new Error(`part${i}: HTTP ${r.status}`);
+    const blob = await r.blob();
+    parts.push(blob);
+    bytes += blob.size;
+    say(`DOWNLOADING ASSETS... ${(bytes / 1048576).toFixed(0)} MB (${i}/${ZIP_PARTS})`);
   }
-
-  async readRange(start, end) {
-    const out = new Uint8Array(end - start);
-    let w = 0;
-    for (const p of this.planRange(start, end)) {
-      const r = await originalFetch(`${ZIP_BASE}.part${p.part}`,
-        { headers: { Range: `bytes=${p.from}-${p.to}` } });
-      if (!r.ok) throw new Error(`part${p.part} range: ${r.status}`);
-      const buf = new Uint8Array(await r.arrayBuffer());
-      out.set(buf, w);
-      w += buf.length;
-    }
-    return out;
-  }
-
-  /* Streams [start, end) without ever holding the whole range. */
-  streamRange(start, end, onBytes) {
-    const plan = this.planRange(start, end);
-    let idx = 0, reader = null;
-    return new ReadableStream({
-      pull: async (controller) => {
-        while (true) {
-          if (!reader) {
-            if (idx >= plan.length) { controller.close(); return; }
-            const p = plan[idx++];
-            const r = await originalFetch(`${ZIP_BASE}.part${p.part}`,
-              { headers: { Range: `bytes=${p.from}-${p.to}` } });
-            if (!r.ok) { controller.error(new Error(`part${p.part}: ${r.status}`)); return; }
-            reader = r.body.getReader();
-          }
-          const { done, value } = await reader.read();
-          if (done) { reader = null; continue; }
-          if (onBytes) onBytes(value.length);
-          controller.enqueue(value);
-          return;
-        }
-      },
-      cancel: () => reader && reader.cancel(),
-    });
-  }
+  return new Blob(parts);
 }
 
-/* ================= ZIP DIRECTORY ================= */
 const u16 = (b, o) => b[o] | (b[o + 1] << 8);
 const u32 = (b, o) => (b[o] | (b[o + 1] << 8) | (b[o + 2] << 16)) + b[o + 3] * 0x1000000;
 
+const readBytes = async (blob, start, end) =>
+  new Uint8Array(await blob.slice(start, end).arrayBuffer());
+
 async function readEntries(zip) {
   const tailLen = Math.min(65557, zip.size);
-  const tail = await zip.readRange(zip.size - tailLen, zip.size);
+  const tail = await readBytes(zip, zip.size - tailLen, zip.size);
 
   let eocd = -1;
   for (let i = tail.length - 22; i >= 0; i--) {
@@ -169,9 +114,8 @@ async function readEntries(zip) {
   if (eocd < 0) throw new Error("zip end-of-central-directory not found");
 
   const count = u16(tail, eocd + 10);
-  const cdSize = u32(tail, eocd + 12);
   const cdOff = u32(tail, eocd + 16);
-  const cd = await zip.readRange(cdOff, cdOff + cdSize);
+  const cd = await readBytes(zip, cdOff, cdOff + u32(tail, eocd + 12));
 
   const entries = [];
   let p = 0;
@@ -181,7 +125,6 @@ async function readEntries(zip) {
     entries.push({
       method: u16(cd, p + 10),
       csize: u32(cd, p + 20),
-      usize: u32(cd, p + 24),
       lho: u32(cd, p + 42),
       name: new TextDecoder().decode(cd.subarray(p + 46, p + 46 + nlen)),
     });
@@ -196,43 +139,35 @@ async function unpack() {
     throw new Error("This browser is too old - needs Chrome 103+ for DecompressionStream");
   }
 
+  const zip = await downloadZip();
+
   say("READING ASSET INDEX...");
-  const zip = await new SplitZip().open();
-  const entries = (await readEntries(zip)).sort((a, b) => a.lho - b.lho);
-
-  const totalBytes = entries.reduce((n, e) => n + e.csize, 0);
-  const totalMB = (totalBytes / 1048576).toFixed(0);
-  let doneBytes = 0;
-
+  const entries = await readEntries(zip);
   const cache = await getCache();
 
   for (let i = 0; i < entries.length; i++) {
     const e = entries[i];
-
-    // The local header repeats the name/extra fields, so the payload offset
-    // has to be read from it rather than assumed.
-    const lh = await zip.readRange(e.lho, e.lho + 30);
-    if (u32(lh, 0) !== 0x04034b50) throw new Error(`bad local header for ${e.name}`);
-    const dataStart = e.lho + 30 + u16(lh, 26) + u16(lh, 28);
-
     if (e.method !== 8 && e.method !== 0) {
       throw new Error(`unsupported zip method ${e.method}`);
     }
 
-    const label = `UNPACKING ${i + 1}/${entries.length}`;
+    // The local header repeats the name/extra fields, so the payload offset
+    // has to be read from it rather than assumed.
+    const lh = await readBytes(zip, e.lho, e.lho + 30);
+    if (u32(lh, 0) !== 0x04034b50) throw new Error(`bad local header for ${e.name}`);
+    const dataStart = e.lho + 30 + u16(lh, 26) + u16(lh, 28);
+
+    say(`UNPACKING ${i + 1}/${entries.length}...`);
+
     // Built fresh per attempt: a stream can only be consumed once, and
     // teeing one with clone() would buffer the whole entry in memory.
     const openStream = () => {
-      let s = zip.streamRange(dataStart, dataStart + e.csize, (n) => {
-        doneBytes += n;
-        say(`${label} ... ${(doneBytes / 1048576).toFixed(0)} / ${totalMB} MB`);
-      });
+      const s = zip.slice(dataStart, dataStart + e.csize).stream();
       return e.method === 8
         ? s.pipeThrough(new DecompressionStream("deflate-raw"))
         : s;
     };
 
-    const startedAt = doneBytes;
     try {
       // Streams into cache storage; nothing buffers in the JS heap.
       await cache.put(e.name, new Response(openStream()));
@@ -240,7 +175,6 @@ async function unpack() {
       // Older Chrome refuses streamed bodies in Cache.put - fall back to a
       // Blob, which Chrome keeps on disk rather than in the heap.
       console.warn("streamed cache.put failed, using blob:", err);
-      doneBytes = startedAt;
       await cache.put(e.name, new Response(await new Response(openStream()).blob()));
     }
   }
