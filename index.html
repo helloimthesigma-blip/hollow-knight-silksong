@@ -78,115 +78,88 @@ async function dropOldCaches() {
 }
 
 /* ================= ZIP =================
-   GitHub Pages re-compresses these files for any browser (which always sends
-   Accept-Encoding: gzip), so Content-Length and Range offsets both describe
-   the *compressed* stream while fetch hands back decompressed bytes. Byte
-   ranges are therefore meaningless over the network, and Accept-Encoding is a
-   forbidden header so it can't be turned off.
+   The archive is read as one forward pass over the 100 parts, parsing local
+   file headers as they go by and piping each entry straight into the cache.
 
-   Instead each part is downloaded whole into a Blob. Chrome keeps Blobs in its
-   own storage rather than the JS heap, so this stays cheap, and slicing a Blob
-   is a local operation with none of the header trouble. */
-async function downloadZip() {
-  const parts = [], sizes = [];
-  let bytes = 0;
-
-  for (let i = 1; i <= ZIP_PARTS; i++) {
-    let blob = null, lastErr = "";
-    // cache: no-store keeps Chrome's HTTP cache out of it. On a machine that
-    // is low on disk the cache can hand back a truncated entry, which shows up
-    // much later as an unreadable archive.
-    for (let attempt = 1; attempt <= 3 && !blob; attempt++) {
-      try {
-        const r = await originalFetch(`${ZIP_BASE}.part${i}`, { cache: "no-store" });
-        if (!r.ok) { lastErr = `HTTP ${r.status}`; continue; }
-        const b = await r.blob();
-        if (b.size === 0) { lastErr = "empty response"; continue; }
-        blob = b;
-      } catch (e) {
-        lastErr = e.message;
-      }
-    }
-    if (!blob) throw new Error(`part${i} failed after 3 tries: ${lastErr}`);
-
-    parts.push(blob);
-    sizes.push(blob.size);
-    bytes += blob.size;
-    say(`DOWNLOADING ASSETS... ${(bytes / 1048576).toFixed(0)} MB (${i}/${ZIP_PARTS})`);
-  }
-
-  const zip = new Blob(parts);
-  if (zip.size !== bytes) {
-    throw new Error(`assembled archive is ${zip.size} bytes but parts totalled ${bytes}`);
-  }
-  return { zip, sizes };
-}
-
-/* Only called when the archive turns out to be unreadable, to say why. */
-async function describeArchive(zip, sizes) {
-  const lines = [];
-  lines.push(`archive ${zip.size} bytes from ${sizes.length} parts`);
-
-  // parts 1..n-1 are produced at a fixed size, so any odd one out is suspect
-  const counts = {};
-  sizes.slice(0, -1).forEach(s => counts[s] = (counts[s] || 0) + 1);
-  const usual = +Object.keys(counts).sort((a, b) => counts[b] - counts[a])[0];
-  const odd = sizes.map((s, i) => [i + 1, s])
-                   .filter(([i, s]) => i < sizes.length && s !== usual);
-  lines.push(`usual part size ${usual}`);
-  lines.push(odd.length ? `WRONG SIZE: ${odd.map(([i, s]) => `part${i}=${s}`).join(", ")}`
-                        : "all parts the expected size");
-
-  try {
-    const { usage, quota } = await navigator.storage.estimate();
-    lines.push(`storage ${(usage / 1073741824).toFixed(2)} GB used of ${(quota / 1073741824).toFixed(2)} GB`);
-  } catch (e) { /* not fatal */ }
-
-  try {
-    const tail = new Uint8Array(await zip.slice(zip.size - 32, zip.size).arrayBuffer());
-    lines.push(`last 32 bytes: ${[...tail].map(b => b.toString(16).padStart(2, "0")).join("")}`);
-  } catch (e) {
-    lines.push(`could not read the end of the archive: ${e.message}`);
-  }
-
-  return lines.join("\n");
-}
+   Nothing is ever assembled or seeked. An earlier version downloaded every
+   part into Blobs, concatenated them and read the central directory off the
+   end, which meant holding a ~2 GB Blob - more than Chrome's blob storage
+   would give up on a machine short of disk, and the archive then read back
+   empty. Every local header here carries its compressed size and none use a
+   data descriptor, so a single pass is enough. */
 
 const u16 = (b, o) => b[o] | (b[o + 1] << 8);
 const u32 = (b, o) => (b[o] | (b[o + 1] << 8) | (b[o + 2] << 16)) + b[o + 3] * 0x1000000;
 
-const readBytes = async (blob, start, end) =>
-  new Uint8Array(await blob.slice(start, end).arrayBuffer());
+const SIG_LOCAL   = 0x04034b50;  // start of a file entry
+const SIG_CENTRAL = 0x02014b50;  // start of the central directory = end of data
 
-async function readEntries(zip) {
-  const tailLen = Math.min(65557, zip.size);
-  const tail = await readBytes(zip, zip.size - tailLen, zip.size);
+/* The 100 parts as one continuous stream of chunks. */
+async function* archiveChunks(onPart) {
+  for (let i = 1; i <= ZIP_PARTS; i++) {
+    onPart(i);
+    let res = null, lastErr = "";
+    // cache: no-store keeps Chrome's HTTP cache out of it; on a machine low on
+    // disk it can hand back a truncated entry.
+    for (let attempt = 1; attempt <= 3 && !res; attempt++) {
+      try {
+        const r = await originalFetch(`${ZIP_BASE}.part${i}`, { cache: "no-store" });
+        if (r.ok) res = r; else lastErr = `HTTP ${r.status}`;
+      } catch (e) { lastErr = e.message; }
+    }
+    if (!res) throw new Error(`part${i} failed after 3 tries: ${lastErr}`);
 
-  let eocd = -1;
-  for (let i = tail.length - 22; i >= 0; i--) {
-    if (u32(tail, i) === 0x06054b50) { eocd = i; break; }
+    const reader = res.body.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      yield value;
+    }
   }
-  if (eocd < 0) throw new Error("EOCD_NOT_FOUND");
+}
 
-  const count = u16(tail, eocd + 10);
-  const cdOff = u32(tail, eocd + 16);
-  const cd = await readBytes(zip, cdOff, cdOff + u32(tail, eocd + 12));
+/* Sequential reader over those chunks. */
+class ByteSource {
+  constructor(gen) { this.gen = gen; this.buf = null; this.pos = 0; this.read = 0; }
 
-  const entries = [];
-  let p = 0;
-  for (let i = 0; i < count; i++) {
-    if (u32(cd, p) !== 0x02014b50) throw new Error("bad central directory entry");
-    const nlen = u16(cd, p + 28), elen = u16(cd, p + 30), clen = u16(cd, p + 32);
-    entries.push({
-      method: u16(cd, p + 10),
-      csize: u32(cd, p + 20),
-      usize: u32(cd, p + 24),
-      lho: u32(cd, p + 42),
-      name: new TextDecoder().decode(cd.subarray(p + 46, p + 46 + nlen)),
+  async take(max) {
+    while (!this.buf || this.pos >= this.buf.length) {
+      const { value, done } = await this.gen.next();
+      if (done) return null;
+      this.buf = value; this.pos = 0;
+    }
+    const n = Math.min(max, this.buf.length - this.pos);
+    const out = this.buf.slice(this.pos, this.pos + n);
+    this.pos += n;
+    this.read += n;
+    return out;
+  }
+
+  async exactly(n) {
+    const out = new Uint8Array(n);
+    let w = 0;
+    while (w < n) {
+      const c = await this.take(n - w);
+      if (!c) throw new Error(`archive ended early: wanted ${n} bytes, got ${w}`);
+      out.set(c, w); w += c.length;
+    }
+    return out;
+  }
+
+  /* Exactly n bytes, as a stream, so an entry never lands in a variable. */
+  stream(n) {
+    let left = n;
+    const src = this;
+    return new ReadableStream({
+      async pull(controller) {
+        if (left === 0) { controller.close(); return; }
+        const chunk = await src.take(Math.min(left, 1 << 20));
+        if (!chunk) { controller.error(new Error("archive ended mid-entry")); return; }
+        left -= chunk.length;
+        controller.enqueue(chunk);
+      },
     });
-    p += 46 + nlen + elen + clen;
   }
-  return entries;
 }
 
 /* ================= UNPACK ================= */
@@ -195,73 +168,70 @@ async function unpack() {
     throw new Error("This browser is too old - needs Chrome 103+ for DecompressionStream");
   }
 
-  const { zip, sizes } = await downloadZip();
-
-  say("READING ASSET INDEX...");
-  let entries;
-  try {
-    entries = await readEntries(zip);
-  } catch (err) {
-    const detail = await describeArchive(zip, sizes);
-    console.error("archive unreadable:\n" + detail);
-    throw new Error(`${err.message}\n${detail}`);
-  }
   const cache = await getCache();
 
-  const totalMB = (entries.reduce((n, e) => n + e.usize, 0) / 1048576).toFixed(0);
-  let doneBytes = 0, shownMB = -1;
-
-  // Unpacking writes a couple of GB to disk and the biggest single bundle is
-  // ~481 MB, so without a byte counter one label can sit there for minutes and
-  // look like a hang.
-  const counter = () => new TransformStream({
-    transform(chunk, controller) {
-      doneBytes += chunk.byteLength;
-      const mb = Math.floor(doneBytes / 1048576);
-      if (mb !== shownMB) {
-        shownMB = mb;
-        say(`UNPACKING ${mb} / ${totalMB} MB`);
-      }
-      controller.enqueue(chunk);
-    },
-  });
-
-  for (let i = 0; i < entries.length; i++) {
-    const e = entries[i];
-    if (e.method !== 8 && e.method !== 0) {
-      throw new Error(`unsupported zip method ${e.method}`);
-    }
-
-    // The local header repeats the name/extra fields, so the payload offset
-    // has to be read from it rather than assumed.
-    const lh = await readBytes(zip, e.lho, e.lho + 30);
-    if (u32(lh, 0) !== 0x04034b50) throw new Error(`bad local header for ${e.name}`);
-    const dataStart = e.lho + 30 + u16(lh, 26) + u16(lh, 28);
-
-    // Built fresh per attempt: a stream can only be consumed once, and
-    // teeing one with clone() would buffer the whole entry in memory.
-    const openStream = () => {
-      const s = zip.slice(dataStart, dataStart + e.csize).stream();
-      return (e.method === 8
-        ? s.pipeThrough(new DecompressionStream("deflate-raw"))
-        : s).pipeThrough(counter());
-    };
-
-    const startedAt = doneBytes;
-    try {
-      // Streams into cache storage; nothing buffers in the JS heap.
-      await cache.put(e.name, new Response(openStream()));
-    } catch (err) {
-      // Older Chrome refuses streamed bodies in Cache.put - fall back to a
-      // Blob, which Chrome keeps on disk rather than in the heap.
-      console.warn("streamed cache.put failed, using blob:", err);
-      doneBytes = startedAt;
-      await cache.put(e.name, new Response(await new Response(openStream()).blob()));
-    }
+  // Chrome streams a Response body straight into cache storage. If this build
+  // won't, entries have to be buffered instead, so find out once up front.
+  let canStreamPut = true;
+  try {
+    await cache.put("__probe", new Response(new Blob(["x"]).stream()));
+    await cache.delete("__probe");
+  } catch (e) {
+    canStreamPut = false;
+    console.warn("streamed cache.put unavailable, buffering entries instead", e);
   }
 
+  let part = 0, shownMB = -1, count = 0;
+  const src = new ByteSource(archiveChunks((i) => { part = i; }));
+
+  const tick = () => {
+    const mb = Math.floor(src.read / 1048576);
+    if (mb !== shownMB) {
+      shownMB = mb;
+      say(`UNPACKING ${mb} MB - part ${part}/${ZIP_PARTS}, ${count} bundles`);
+    }
+  };
+
+  for (;;) {
+    const head = await src.exactly(4);
+    const sig = u32(head, 0);
+    if (sig === SIG_CENTRAL) break;      // reached the directory: all entries done
+    if (sig !== SIG_LOCAL) {
+      throw new Error(`unexpected signature 0x${sig.toString(16)} after ${count} bundles, ${src.read} bytes`);
+    }
+
+    const h = await src.exactly(26);     // rest of the local file header
+    const method = u16(h, 4);
+    const csize  = u32(h, 14);
+    const nlen   = u16(h, 22);
+    const elen   = u16(h, 24);
+    const name   = new TextDecoder().decode(await src.exactly(nlen));
+    if (elen) await src.exactly(elen);
+
+    if (method !== 8 && method !== 0) throw new Error(`unsupported zip method ${method} for ${name}`);
+
+    const counter = new TransformStream({
+      transform(chunk, controller) { tick(); controller.enqueue(chunk); },
+    });
+    const raw = src.stream(csize);
+    const body = (method === 8
+      ? raw.pipeThrough(new DecompressionStream("deflate-raw"))
+      : raw).pipeThrough(counter);
+
+    if (canStreamPut) {
+      await cache.put(name, new Response(body));
+    } else {
+      await cache.put(name, new Response(await new Response(body).blob()));
+    }
+
+    count++;
+    tick();
+  }
+
+  if (count === 0) throw new Error("archive contained no entries");
+
   await cache.put("CACHE_COMPLETE", new Response("ok"));
-  console.log("Unpack complete");
+  console.log(`Unpack complete: ${count} bundles, ${src.read} bytes read`);
 }
 
 /* ================= UNITY ================= */
