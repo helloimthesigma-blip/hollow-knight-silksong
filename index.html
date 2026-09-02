@@ -80,6 +80,9 @@ const TUNE = new URLSearchParams(location.search).get("tune") || "concurrency";
 // largest single bundle here is 481 MB.
 const MAX_CONCURRENT_BUNDLE_LOADS = 1;
 
+const LOADED_KEY = "silksong-bundles-loaded";
+const loadedBundles = [];
+
 // Heap growth overshoot as a percentage, two digits. The default 20% is what
 // took the heap to 512 * 1.2^8 = 2202 MB when the game had asked for somewhere
 // between 1835 and 2202.
@@ -93,7 +96,16 @@ window.fetch = async function (resource, options) {
   if (url && url.includes(".bundle")) {
     const name = url.split("/").pop().split("?")[0];
     const hit = await (await getCache()).match(name);
-    if (hit) return hit;
+    if (hit) {
+      // Every bundle Unity loads passes through here. Recording them says
+      // whether it is pulling in the whole 2371 MB of content at startup - in
+      // which case cutting unused bundles would help - or only a few, in which
+      // case the memory is going somewhere else and cutting would not.
+      loadedBundles.push(name);
+      try { localStorage.setItem(LOADED_KEY, JSON.stringify(loadedBundles)); } catch (e) {}
+      console.log(`bundle ${loadedBundles.length}: ${name}`);
+      return hit;
+    }
   }
 
   if (TUNE === "concurrency" && url && url.endsWith("settings.json")) {
@@ -344,6 +356,13 @@ function reportLastRun() {
   if (last) {
     console.log(`Previous run reached a ${last} MB wasm heap before stopping.`);
   }
+  try {
+    const prev = JSON.parse(localStorage.getItem(LOADED_KEY) || "[]");
+    if (prev.length) {
+      console.log(`Previous run loaded ${prev.length} bundles before stopping:`);
+      console.log(prev.join("\n"));
+    }
+  } catch (e) { /* nothing useful to report */ }
   if (navigator.deviceMemory) {
     console.log(`This device reports roughly ${navigator.deviceMemory} GB of RAM.`);
   }
