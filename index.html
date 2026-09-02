@@ -36,7 +36,7 @@
   and got the renderer killed (Chrome "Aw, Snap!", error code 9).
 */
 
-const CACHE_NAME = "hksilksongcache-v4";
+const CACHE_NAME = "hksilksongcache-v5";
 const ZIP_PARTS = 100;
 const ZIP_BASE = "StreamingAssets/aa/WebGL.zip";
 
@@ -44,17 +44,17 @@ const ZIP_BASE = "StreamingAssets/aa/WebGL.zip";
    1 also stops Retina/HiDPI screens rendering at 2x (4x the pixels). */
 const RENDER_SCALE = 1;
 
-// "./" resolves against the document URL, so a URL without a trailing slash
-// ("/repo" rather than "/repo/") sends Unity and every asset fetch to the
-// parent directory. Work out the real directory and pin <base> to it.
-function documentDirectory() {
-  const u = new URL(location.href);
-  u.hash = ""; u.search = "";
-  const last = u.pathname.split("/").pop();
-  if (last && !last.includes(".")) u.pathname += "/";   // ".../repo" -> ".../repo/"
-  return new URL(".", u).href;
-}
-document.querySelector("base").href = documentDirectory();
+// Where the assets actually live. This is deliberately absolute: the page is
+// not always served from the same origin as its assets, and when it isn't,
+// relative URLs resolve against whatever host served the page and fetch that
+// host's pages instead of the archive. Pointing at this fork rather than
+// upstream is what makes the patched 512 MB wasm the one that gets used.
+const ASSET_BASE =
+  "https://cdn.jsdelivr.net/gh/helloimthesigma-blip/hollow-knight-silksong@master/";
+
+// Unity reads document.querySelector('base').href to find StreamingAssets, so
+// setting this fixes asset resolution for the loader and for us at once.
+document.querySelector("base").href = ASSET_BASE;
 
 const loadingText = document.querySelector("#loading-text");
 const originalFetch = window.fetch.bind(window);
