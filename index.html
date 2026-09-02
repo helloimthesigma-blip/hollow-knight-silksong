@@ -88,17 +88,68 @@ async function dropOldCaches() {
    own storage rather than the JS heap, so this stays cheap, and slicing a Blob
    is a local operation with none of the header trouble. */
 async function downloadZip() {
-  const parts = [];
+  const parts = [], sizes = [];
   let bytes = 0;
+
   for (let i = 1; i <= ZIP_PARTS; i++) {
-    const r = await originalFetch(`${ZIP_BASE}.part${i}`);
-    if (!r.ok) throw new Error(`part${i}: HTTP ${r.status}`);
-    const blob = await r.blob();
+    let blob = null, lastErr = "";
+    // cache: no-store keeps Chrome's HTTP cache out of it. On a machine that
+    // is low on disk the cache can hand back a truncated entry, which shows up
+    // much later as an unreadable archive.
+    for (let attempt = 1; attempt <= 3 && !blob; attempt++) {
+      try {
+        const r = await originalFetch(`${ZIP_BASE}.part${i}`, { cache: "no-store" });
+        if (!r.ok) { lastErr = `HTTP ${r.status}`; continue; }
+        const b = await r.blob();
+        if (b.size === 0) { lastErr = "empty response"; continue; }
+        blob = b;
+      } catch (e) {
+        lastErr = e.message;
+      }
+    }
+    if (!blob) throw new Error(`part${i} failed after 3 tries: ${lastErr}`);
+
     parts.push(blob);
+    sizes.push(blob.size);
     bytes += blob.size;
     say(`DOWNLOADING ASSETS... ${(bytes / 1048576).toFixed(0)} MB (${i}/${ZIP_PARTS})`);
   }
-  return new Blob(parts);
+
+  const zip = new Blob(parts);
+  if (zip.size !== bytes) {
+    throw new Error(`assembled archive is ${zip.size} bytes but parts totalled ${bytes}`);
+  }
+  return { zip, sizes };
+}
+
+/* Only called when the archive turns out to be unreadable, to say why. */
+async function describeArchive(zip, sizes) {
+  const lines = [];
+  lines.push(`archive ${zip.size} bytes from ${sizes.length} parts`);
+
+  // parts 1..n-1 are produced at a fixed size, so any odd one out is suspect
+  const counts = {};
+  sizes.slice(0, -1).forEach(s => counts[s] = (counts[s] || 0) + 1);
+  const usual = +Object.keys(counts).sort((a, b) => counts[b] - counts[a])[0];
+  const odd = sizes.map((s, i) => [i + 1, s])
+                   .filter(([i, s]) => i < sizes.length && s !== usual);
+  lines.push(`usual part size ${usual}`);
+  lines.push(odd.length ? `WRONG SIZE: ${odd.map(([i, s]) => `part${i}=${s}`).join(", ")}`
+                        : "all parts the expected size");
+
+  try {
+    const { usage, quota } = await navigator.storage.estimate();
+    lines.push(`storage ${(usage / 1073741824).toFixed(2)} GB used of ${(quota / 1073741824).toFixed(2)} GB`);
+  } catch (e) { /* not fatal */ }
+
+  try {
+    const tail = new Uint8Array(await zip.slice(zip.size - 32, zip.size).arrayBuffer());
+    lines.push(`last 32 bytes: ${[...tail].map(b => b.toString(16).padStart(2, "0")).join("")}`);
+  } catch (e) {
+    lines.push(`could not read the end of the archive: ${e.message}`);
+  }
+
+  return lines.join("\n");
 }
 
 const u16 = (b, o) => b[o] | (b[o + 1] << 8);
@@ -115,7 +166,7 @@ async function readEntries(zip) {
   for (let i = tail.length - 22; i >= 0; i--) {
     if (u32(tail, i) === 0x06054b50) { eocd = i; break; }
   }
-  if (eocd < 0) throw new Error("zip end-of-central-directory not found");
+  if (eocd < 0) throw new Error("EOCD_NOT_FOUND");
 
   const count = u16(tail, eocd + 10);
   const cdOff = u32(tail, eocd + 16);
@@ -144,10 +195,17 @@ async function unpack() {
     throw new Error("This browser is too old - needs Chrome 103+ for DecompressionStream");
   }
 
-  const zip = await downloadZip();
+  const { zip, sizes } = await downloadZip();
 
   say("READING ASSET INDEX...");
-  const entries = await readEntries(zip);
+  let entries;
+  try {
+    entries = await readEntries(zip);
+  } catch (err) {
+    const detail = await describeArchive(zip, sizes);
+    console.error("archive unreadable:\n" + detail);
+    throw new Error(`${err.message}\n${detail}`);
+  }
   const cache = await getCache();
 
   const totalMB = (entries.reduce((n, e) => n + e.usize, 0) / 1048576).toFixed(0);
@@ -280,6 +338,11 @@ function startUnity() {
     startUnity();
   } catch (err) {
     console.error(err);
+    // multi-line diagnostics need to be legible at 48px cursive
+    loadingText.style.fontSize = "15px";
+    loadingText.style.fontFamily = "monospace";
+    loadingText.style.whiteSpace = "pre-wrap";
+    loadingText.style.textAlign = "left";
     say("ERROR: " + err.message);
   }
 })();
