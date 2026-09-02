@@ -44,6 +44,18 @@ const ZIP_BASE = "StreamingAssets/aa/WebGL.zip";
    1 also stops Retina/HiDPI screens rendering at 2x (4x the pixels). */
 const RENDER_SCALE = 1;
 
+// "./" resolves against the document URL, so a URL without a trailing slash
+// ("/repo" rather than "/repo/") sends Unity and every asset fetch to the
+// parent directory. Work out the real directory and pin <base> to it.
+function documentDirectory() {
+  const u = new URL(location.href);
+  u.hash = ""; u.search = "";
+  const last = u.pathname.split("/").pop();
+  if (last && !last.includes(".")) u.pathname += "/";   // ".../repo" -> ".../repo/"
+  return new URL(".", u).href;
+}
+document.querySelector("base").href = documentDirectory();
+
 const loadingText = document.querySelector("#loading-text");
 const originalFetch = window.fetch.bind(window);
 
@@ -95,7 +107,7 @@ const SIG_LOCAL   = 0x04034b50;  // start of a file entry
 const SIG_CENTRAL = 0x02014b50;  // start of the central directory = end of data
 
 /* The 100 parts as one continuous stream of chunks. */
-async function* archiveChunks(onPart) {
+async function* archiveChunks(onPart, info) {
   for (let i = 1; i <= ZIP_PARTS; i++) {
     onPart(i);
     let res = null, lastErr = "";
@@ -105,6 +117,10 @@ async function* archiveChunks(onPart) {
       try {
         const r = await originalFetch(`${ZIP_BASE}.part${i}`, { cache: "no-store" });
         if (r.ok) res = r; else lastErr = `HTTP ${r.status}`;
+        info.url = r.url;
+        info.status = r.status;
+        info.type = r.headers.get("content-type");
+        info.length = r.headers.get("content-length");
       } catch (e) { lastErr = e.message; }
     }
     if (!res) throw new Error(`part${i} failed after 3 tries: ${lastErr}`);
@@ -182,7 +198,8 @@ async function unpack() {
   }
 
   let part = 0, shownMB = -1, count = 0;
-  const src = new ByteSource(archiveChunks((i) => { part = i; }));
+  const info = {};
+  const src = new ByteSource(archiveChunks((i) => { part = i; }, info));
 
   const tick = () => {
     const mb = Math.floor(src.read / 1048576);
@@ -197,7 +214,19 @@ async function unpack() {
     const sig = u32(head, 0);
     if (sig === SIG_CENTRAL) break;      // reached the directory: all entries done
     if (sig !== SIG_LOCAL) {
-      throw new Error(`unexpected signature 0x${sig.toString(16)} after ${count} bundles, ${src.read} bytes`);
+      // Show what actually arrived - a wrong signature almost always means the
+      // fetch returned something other than the archive, e.g. an error page.
+      const extra = await src.take(60);
+      const seen = new Uint8Array([...head, ...(extra || [])]);
+      const hex = [...seen].map(b => b.toString(16).padStart(2, "0")).join(" ");
+      const txt = [...seen].map(b => (b >= 32 && b < 127 ? String.fromCharCode(b) : ".")).join("");
+      throw new Error(
+        `unexpected signature 0x${sig.toString(16)} after ${count} bundles, ${src.read} bytes\n` +
+        `fetched: ${info.url}\n` +
+        `status ${info.status}, type ${info.type}, length ${info.length}\n` +
+        `hex:  ${hex}\n` +
+        `text: ${txt}`
+      );
     }
 
     const h = await src.exactly(26);     // rest of the local file header
