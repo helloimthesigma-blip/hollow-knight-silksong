@@ -86,8 +86,9 @@ const loadedBundles = [];
 // Heap growth overshoot as a percentage, two digits. The default 20% is what
 // took the heap to 512 * 1.2^8 = 2202 MB when the game had asked for somewhere
 // between 1835 and 2202.
-const GROWTH = (new URLSearchParams(location.search).get("growth") || "05")
-  .replace(/\D/g, "").padStart(2, "0").slice(0, 2);
+// The heap growth factor is patched into Build/w-pt.framework.js.unityweb
+// itself. It cannot be done from here: Unity loads Build/* through its own
+// cache layer over XHR, which never passes through window.fetch.
 
 window.fetch = async function (resource, options) {
   const url = typeof resource === "string" ? resource : resource.url;
@@ -123,34 +124,6 @@ window.fetch = async function (resource, options) {
         "content-length": String(body.byteLength),
       },
     });
-  }
-
-  // Emscripten grows the heap to max(requested, oldSize * 1.2), overshooting by
-  // 20% of the current heap each time: +189 MB at 1 GB, +291 MB at 1.5 GB. A 5%
-  // factor and a 64 MB cap make that +35 MB and +61 MB. Growth is in-place here
-  // because the module declares a maximum, so extra steps cost little.
-  //
-  // The two edits cancel out in length, so the body is byte-for-byte the same
-  // size and the original headers still describe it. An earlier attempt built a
-  // fresh Response without them, and the missing Content-Length stalled the
-  // loader at 90%.
-  if (TUNE === "all" && url && url.includes("framework.js")) {
-    const r = await originalFetch(resource, options);
-    if (!r.ok) return r;
-    const js = await r.text();
-    // &growth=02 overshoots by 2% instead of 5%; lower means less waste but
-    // more growth steps. ".0N" is one character longer than ".2" and the
-    // 67108864 cap is one shorter than 536870912, so the body length is
-    // unchanged and the original headers still describe it.
-    const patched = js
-      .replace("1 + .2 / cutDown", `1 + .${GROWTH} / cutDown`)
-      .replace("requestedSize + 536870912", "requestedSize + 67108864");
-    if (patched === js || patched.length !== js.length) {
-      console.warn("heap growth patch did not apply cleanly; running unmodified");
-      return new Response(js, { headers: r.headers });
-    }
-    console.log("heap growth tightened: 20% overshoot -> 5%");
-    return new Response(patched, { headers: r.headers });
   }
 
   return originalFetch(resource, options);
@@ -416,7 +389,7 @@ function startUnity() {
   const buildUrl = "Build";
   const config = {
     dataUrl: buildUrl + "/w-pt.data.unityweb",
-    frameworkUrl: buildUrl + "/w-pt.framework.js.unityweb",
+    frameworkUrl: buildUrl + "/w-pt.framework.js.unityweb?fwv=2",
     codeUrl: buildUrl + "/w-pt.wasm.unityweb",
     streamingAssetsUrl: "StreamingAssets",
     companyName: "EDUrocks Group, Truffled, GN-Math",
