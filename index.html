@@ -3,6 +3,10 @@
   <head>
     <meta charset="utf-8">
     <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+    <!-- Unity's loader does document.querySelector('base').href with no null
+         check, so this tag has to exist. "./" resolves to this page's own
+         directory, keeping everything on the Pages origin. -->
+    <base href="./">
     <title>Unity Web Player | Hollow Knight SilkSong</title>
     <link rel="shortcut icon" href="TemplateData/favicon.ico">
     <link rel="stylesheet" href="TemplateData/style.css">
@@ -125,6 +129,7 @@ async function readEntries(zip) {
     entries.push({
       method: u16(cd, p + 10),
       csize: u32(cd, p + 20),
+      usize: u32(cd, p + 24),
       lho: u32(cd, p + 42),
       name: new TextDecoder().decode(cd.subarray(p + 46, p + 46 + nlen)),
     });
@@ -145,6 +150,24 @@ async function unpack() {
   const entries = await readEntries(zip);
   const cache = await getCache();
 
+  const totalMB = (entries.reduce((n, e) => n + e.usize, 0) / 1048576).toFixed(0);
+  let doneBytes = 0, shownMB = -1;
+
+  // Unpacking writes a couple of GB to disk and the biggest single bundle is
+  // ~481 MB, so without a byte counter one label can sit there for minutes and
+  // look like a hang.
+  const counter = () => new TransformStream({
+    transform(chunk, controller) {
+      doneBytes += chunk.byteLength;
+      const mb = Math.floor(doneBytes / 1048576);
+      if (mb !== shownMB) {
+        shownMB = mb;
+        say(`UNPACKING ${mb} / ${totalMB} MB`);
+      }
+      controller.enqueue(chunk);
+    },
+  });
+
   for (let i = 0; i < entries.length; i++) {
     const e = entries[i];
     if (e.method !== 8 && e.method !== 0) {
@@ -157,17 +180,16 @@ async function unpack() {
     if (u32(lh, 0) !== 0x04034b50) throw new Error(`bad local header for ${e.name}`);
     const dataStart = e.lho + 30 + u16(lh, 26) + u16(lh, 28);
 
-    say(`UNPACKING ${i + 1}/${entries.length}...`);
-
     // Built fresh per attempt: a stream can only be consumed once, and
     // teeing one with clone() would buffer the whole entry in memory.
     const openStream = () => {
       const s = zip.slice(dataStart, dataStart + e.csize).stream();
-      return e.method === 8
+      return (e.method === 8
         ? s.pipeThrough(new DecompressionStream("deflate-raw"))
-        : s;
+        : s).pipeThrough(counter());
     };
 
+    const startedAt = doneBytes;
     try {
       // Streams into cache storage; nothing buffers in the JS heap.
       await cache.put(e.name, new Response(openStream()));
@@ -175,6 +197,7 @@ async function unpack() {
       // Older Chrome refuses streamed bodies in Cache.put - fall back to a
       // Blob, which Chrome keeps on disk rather than in the heap.
       console.warn("streamed cache.put failed, using blob:", err);
+      doneBytes = startedAt;
       await cache.put(e.name, new Response(await new Response(openStream()).blob()));
     }
   }
@@ -253,6 +276,7 @@ function startUnity() {
     } else {
       await unpack();
     }
+    say("STARTING GAME...");
     startUnity();
   } catch (err) {
     console.error(err);
