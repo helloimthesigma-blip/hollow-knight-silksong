@@ -1,7 +1,6 @@
 <!DOCTYPE html>
 <html lang="en-us">
   <head>
-    <base href="https://cdn.jsdelivr.net/gh/web-ports/hollow-knight-silksong@master/">
     <meta charset="utf-8">
     <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
     <title>Unity Web Player | Hollow Knight SilkSong</title>
@@ -20,236 +19,312 @@
       </div>
       <div id="unity-warning"> </div>
     </div>
-    <script src="jszip.js"></script>
 
 <script>
+/*
+  The 21 large asset bundles can't be stored in the repo directly - the biggest
+  is 481 MB and GitHub caps files at 100 MB - so they ship as WebGL.zip split
+  into 100 parts and get unpacked into the Cache API on first load.
+
+  The unpacking is done by range-reading the parts and piping each zip entry
+  through DecompressionStream straight into the cache. Nothing large is ever
+  held in a JS variable, which is what previously exhausted the tab's memory
+  and got the renderer killed (Chrome "Aw, Snap!", error code 9).
+*/
+
+const CACHE_NAME = "hksilksongcache-v3";
+const ZIP_PARTS = 100;
+const ZIP_BASE = "StreamingAssets/aa/WebGL.zip";
+
+/* Pixels the game renders, relative to the canvas. Lower = lighter on the GPU.
+   1 also stops Retina/HiDPI screens rendering at 2x (4x the pixels). */
+const RENDER_SCALE = 1;
+
 const loadingText = document.querySelector("#loading-text");
-const CACHE_NAME = "hksilksongcache-v2"; // bump version if needed
+const originalFetch = window.fetch.bind(window);
 
-/* ================= FETCH OVERRIDE ================= */
-const originalFetch = window.fetch;
+const say = (msg) => { loadingText.textContent = msg; };
 
-window.fetch = async function(resource, options) {
-  let url = typeof resource === "string" ? resource : resource.url;
-  let cleanPath = url.split("/").pop();
+/* ================= CACHE ================= */
+let cachePromise;
+const getCache = () => (cachePromise = cachePromise || caches.open(CACHE_NAME));
 
-  const cache = await caches.open(CACHE_NAME);
-
-  const cachedResponse = await cache.match(cleanPath);
-  if (cachedResponse) {
-    return cachedResponse;
+/* Unity asks for bundles by their plain filename; serve the unpacked copies. */
+window.fetch = async function (resource, options) {
+  const url = typeof resource === "string" ? resource : resource.url;
+  if (url && url.includes(".bundle")) {
+    const name = url.split("/").pop().split("?")[0];
+    const hit = await (await getCache()).match(name);
+    if (hit) return hit;
   }
-
   return originalFetch(resource, options);
 };
 
-/* ================= CACHE CHECK ================= */
-async function isCached() {
-  const cache = await caches.open(CACHE_NAME);
-  const done = await cache.match("CACHE_COMPLETE");
-  return !!done;
+async function isUnpacked() {
+  return !!(await (await getCache()).match("CACHE_COMPLETE"));
 }
 
-async function cleanupOldCaches() {
-  const cacheNames = await caches.keys();
-
-  await Promise.all(
-    cacheNames.map(name => {
-      if (name !== CACHE_NAME && name.includes("hksilksong")) {
-        console.log("Deleting old cache:", name);
-        return caches.delete(name);
-      }
-    })
-  );
+async function dropOldCaches() {
+  for (const name of await caches.keys()) {
+    if (name.includes("hksilksong") && name !== CACHE_NAME) {
+      console.log("Deleting old cache:", name);
+      await caches.delete(name);
+    }
+  }
 }
 
-/* ================= UNZIP ================= */
-async function unzipAndStore(zipBlob) {
-  if (!zipBlob) {
-    throw new Error("ZIP is missing");
-  }
-
-  loadingText.textContent = "EXTRACTING ASSETS...";
-
-  const zip = await JSZip.loadAsync(zipBlob);
-  const files = Object.values(zip.files).filter(f => !f.dir);
-  const total = files.length;
-
-  const cache = await caches.open(CACHE_NAME);
-
-  let processed = 0;
-  const batchSize = 10;
-
-  for (let i = 0; i < files.length; i += batchSize) {
-    const batch = files.slice(i, i + batchSize);
-
-    await Promise.all(batch.map(async (file) => {
-      try {
-        const blob = await file.async("blob");
-        await cache.put(file.name, new Response(blob));
-      } catch (e) {
-        console.error("Failed:", file.name, e);
+/* ================= SPLIT-FILE READER =================
+   Presents the 100 parts as one addressable byte range, fetching only the
+   slices actually asked for. */
+class SplitZip {
+  async open() {
+    const sizes = [];
+    for (let i = 0; i < ZIP_PARTS; i += 10) {
+      const batch = [];
+      for (let j = i; j < Math.min(i + 10, ZIP_PARTS); j++) {
+        batch.push(originalFetch(`${ZIP_BASE}.part${j + 1}`, { method: "HEAD" })
+          .then(r => {
+            if (!r.ok) throw new Error(`HEAD part${j + 1}: ${r.status}`);
+            return [j, +r.headers.get("Content-Length")];
+          }));
       }
-
-      processed++;
-      loadingText.textContent =
-        `EXTRACTING ASSETS... (${processed}/${total})`;
-    }));
-
-    await new Promise(r => setTimeout(r, 0));
+      for (const [j, len] of await Promise.all(batch)) sizes[j] = len;
+    }
+    this.sizes = sizes;
+    this.offsets = [];
+    let t = 0;
+    for (const s of sizes) { this.offsets.push(t); t += s; }
+    this.size = t;
+    return this;
   }
 
-  // ✅ mark cache complete
+  /* Which parts cover global bytes [start, end), and which slice of each. */
+  planRange(start, end) {
+    const plan = [];
+    for (let i = 0; i < this.sizes.length; i++) {
+      const ps = this.offsets[i], pe = ps + this.sizes[i];
+      if (pe <= start || ps >= end) continue;
+      plan.push({
+        part: i + 1,
+        from: Math.max(start, ps) - ps,
+        to: Math.min(end, pe) - ps - 1,
+      });
+    }
+    return plan;
+  }
+
+  async readRange(start, end) {
+    const out = new Uint8Array(end - start);
+    let w = 0;
+    for (const p of this.planRange(start, end)) {
+      const r = await originalFetch(`${ZIP_BASE}.part${p.part}`,
+        { headers: { Range: `bytes=${p.from}-${p.to}` } });
+      if (!r.ok) throw new Error(`part${p.part} range: ${r.status}`);
+      const buf = new Uint8Array(await r.arrayBuffer());
+      out.set(buf, w);
+      w += buf.length;
+    }
+    return out;
+  }
+
+  /* Streams [start, end) without ever holding the whole range. */
+  streamRange(start, end, onBytes) {
+    const plan = this.planRange(start, end);
+    let idx = 0, reader = null;
+    return new ReadableStream({
+      pull: async (controller) => {
+        while (true) {
+          if (!reader) {
+            if (idx >= plan.length) { controller.close(); return; }
+            const p = plan[idx++];
+            const r = await originalFetch(`${ZIP_BASE}.part${p.part}`,
+              { headers: { Range: `bytes=${p.from}-${p.to}` } });
+            if (!r.ok) { controller.error(new Error(`part${p.part}: ${r.status}`)); return; }
+            reader = r.body.getReader();
+          }
+          const { done, value } = await reader.read();
+          if (done) { reader = null; continue; }
+          if (onBytes) onBytes(value.length);
+          controller.enqueue(value);
+          return;
+        }
+      },
+      cancel: () => reader && reader.cancel(),
+    });
+  }
+}
+
+/* ================= ZIP DIRECTORY ================= */
+const u16 = (b, o) => b[o] | (b[o + 1] << 8);
+const u32 = (b, o) => (b[o] | (b[o + 1] << 8) | (b[o + 2] << 16)) + b[o + 3] * 0x1000000;
+
+async function readEntries(zip) {
+  const tailLen = Math.min(65557, zip.size);
+  const tail = await zip.readRange(zip.size - tailLen, zip.size);
+
+  let eocd = -1;
+  for (let i = tail.length - 22; i >= 0; i--) {
+    if (u32(tail, i) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) throw new Error("zip end-of-central-directory not found");
+
+  const count = u16(tail, eocd + 10);
+  const cdSize = u32(tail, eocd + 12);
+  const cdOff = u32(tail, eocd + 16);
+  const cd = await zip.readRange(cdOff, cdOff + cdSize);
+
+  const entries = [];
+  let p = 0;
+  for (let i = 0; i < count; i++) {
+    if (u32(cd, p) !== 0x02014b50) throw new Error("bad central directory entry");
+    const nlen = u16(cd, p + 28), elen = u16(cd, p + 30), clen = u16(cd, p + 32);
+    entries.push({
+      method: u16(cd, p + 10),
+      csize: u32(cd, p + 20),
+      usize: u32(cd, p + 24),
+      lho: u32(cd, p + 42),
+      name: new TextDecoder().decode(cd.subarray(p + 46, p + 46 + nlen)),
+    });
+    p += 46 + nlen + elen + clen;
+  }
+  return entries;
+}
+
+/* ================= UNPACK ================= */
+async function unpack() {
+  if (typeof DecompressionStream === "undefined") {
+    throw new Error("This browser is too old - needs Chrome 103+ for DecompressionStream");
+  }
+
+  say("READING ASSET INDEX...");
+  const zip = await new SplitZip().open();
+  const entries = (await readEntries(zip)).sort((a, b) => a.lho - b.lho);
+
+  const totalBytes = entries.reduce((n, e) => n + e.csize, 0);
+  const totalMB = (totalBytes / 1048576).toFixed(0);
+  let doneBytes = 0;
+
+  const cache = await getCache();
+
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i];
+
+    // The local header repeats the name/extra fields, so the payload offset
+    // has to be read from it rather than assumed.
+    const lh = await zip.readRange(e.lho, e.lho + 30);
+    if (u32(lh, 0) !== 0x04034b50) throw new Error(`bad local header for ${e.name}`);
+    const dataStart = e.lho + 30 + u16(lh, 26) + u16(lh, 28);
+
+    if (e.method !== 8 && e.method !== 0) {
+      throw new Error(`unsupported zip method ${e.method}`);
+    }
+
+    const label = `UNPACKING ${i + 1}/${entries.length}`;
+    // Built fresh per attempt: a stream can only be consumed once, and
+    // teeing one with clone() would buffer the whole entry in memory.
+    const openStream = () => {
+      let s = zip.streamRange(dataStart, dataStart + e.csize, (n) => {
+        doneBytes += n;
+        say(`${label} ... ${(doneBytes / 1048576).toFixed(0)} / ${totalMB} MB`);
+      });
+      return e.method === 8
+        ? s.pipeThrough(new DecompressionStream("deflate-raw"))
+        : s;
+    };
+
+    const startedAt = doneBytes;
+    try {
+      // Streams into cache storage; nothing buffers in the JS heap.
+      await cache.put(e.name, new Response(openStream()));
+    } catch (err) {
+      // Older Chrome refuses streamed bodies in Cache.put - fall back to a
+      // Blob, which Chrome keeps on disk rather than in the heap.
+      console.warn("streamed cache.put failed, using blob:", err);
+      doneBytes = startedAt;
+      await cache.put(e.name, new Response(await new Response(openStream()).blob()));
+    }
+  }
+
   await cache.put("CACHE_COMPLETE", new Response("ok"));
-
-  console.log("Cache complete");
+  console.log("Unpack complete");
 }
 
-/* ================= DOWNLOAD ================= */
-let loadedBytes = 0;
+/* ================= UNITY ================= */
+function startUnity() {
+  const canvas = document.querySelector("#unity-canvas");
+  const loadingBar = document.querySelector("#unity-loading-bar");
+  const progressBarFull = document.querySelector("#unity-progress-bar-full");
+  const warningBanner = document.querySelector("#unity-warning");
 
-async function fetchWithProgress(url) {
-  const response = await originalFetch(url);
-
-  if (!response.ok) {
-    throw new Error("Failed to fetch: " + url);
+  function unityShowBanner(msg, type) {
+    function update() {
+      warningBanner.style.display = warningBanner.children.length ? 'block' : 'none';
+    }
+    let div = document.createElement('div');
+    div.innerHTML = msg;
+    warningBanner.appendChild(div);
+    if (type == 'error') {
+      div.style = 'background:red;padding:10px;';
+    } else {
+      if (type == 'warning') {
+        div.style = 'background:yellow;padding:10px;';
+      }
+      setTimeout(() => { warningBanner.removeChild(div); update(); }, 5000);
+    }
+    update();
   }
 
-  const reader = response.body.getReader();
-  let chunks = [];
-  let received = 0;
+  const buildUrl = "Build";
+  const config = {
+    dataUrl: buildUrl + "/w-pt.data.unityweb",
+    frameworkUrl: buildUrl + "/w-pt.framework.js.unityweb",
+    codeUrl: buildUrl + "/w-pt.wasm.unityweb",
+    streamingAssetsUrl: "StreamingAssets",
+    companyName: "EDUrocks Group, Truffled, GN-Math",
+    productName: "Hollow Knight SilkSong",
+    productVersion: "1.0",
+    showBanner: unityShowBanner,
+    devicePixelRatio: RENDER_SCALE,
+  };
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
+  loadingBar.style.display = "block";
 
-    received += value.length;
-    loadedBytes += value.length;
-    chunks.push(value);
-
-    let mbDone = (loadedBytes / (1024 * 1024)).toFixed(2);
-    let mbTotal = '1986.64';
-
-    loadingText.textContent =
-      `DOWNLOADING ASSETS... (${mbDone} MB / ${mbTotal} MB)`;
-  }
-
-  let fullBuffer = new Uint8Array(received);
-  let offset = 0;
-
-  for (let chunk of chunks) {
-    fullBuffer.set(chunk, offset);
-    offset += chunk.length;
-  }
-
-  return fullBuffer.buffer;
-}
-
-/* ================= MERGE ================= */
-async function mergeFiles(parts) {
-  console.log("Downloading parts:", parts.length);
-
-  const buffers = await Promise.all(
-    parts.map(part => fetchWithProgress(part))
-  );
-
-  return new Blob(buffers);
-}
-
-/* ================= UTIL ================= */
-function getParts(file, start, end) {
-  let parts = [];
-  for (let i = start; i <= end; i++) {
-    parts.push(file + ".part" + i);
-  }
-  return parts;
+  const script = document.createElement("script");
+  script.src = buildUrl + "/w-pt.loader.js";
+  script.onload = () => {
+    createUnityInstance(canvas, config, (progress) => {
+      progressBarFull.style.width = (progress * 100) + "%";
+      say("LOADING... " + Math.round(progress * 100) + "%");
+    })
+      .then(() => { loadingBar.remove(); loadingText.remove(); })
+      .catch((err) => { console.error(err); say("ERROR: " + err); });
+  };
+  script.onerror = () => say("ERROR: could not load " + script.src);
+  document.body.appendChild(script);
 }
 
 /* ================= MAIN ================= */
 (async () => {
   try {
-    await cleanupOldCaches(); 
-    if (!(await isCached())) {
-      loadingText.textContent = "DOWNLOADING ASSETS...";
+    await dropOldCaches();
 
-      const webglzip = await mergeFiles(
-        getParts("StreamingAssets/aa/WebGL.zip", 1, 100)
-      );
+    // Ask Chrome not to evict the unpacked bundles under storage pressure -
+    // otherwise a cleanup could force the whole 2.4 GB unpack to run again.
+    if (typeof navigator !== "undefined" && navigator.storage && navigator.storage.persist) {
+      try { await navigator.storage.persist(); } catch (e) { /* best effort */ }
+    }
 
-      await unzipAndStore(webglzip);
+    if (await isUnpacked()) {
+      say("LOADING FROM CACHE...");
     } else {
-      loadingText.textContent = "LOADING FROM CACHE...";
+      await unpack();
     }
-
-    /* ================= UNITY START ================= */
-    const canvas = document.querySelector("#unity-canvas");
-    const loadingBar = document.querySelector("#unity-loading-bar");
-    const progressBarFull = document.querySelector("#unity-progress-bar-full");
-    const warningBanner = document.querySelector("#unity-warning");
-
-    function unityShowBanner(msg, type) {
-      function update() {
-        warningBanner.style.display =
-          warningBanner.children.length ? 'block' : 'none';
-      }
-
-      let div = document.createElement('div');
-      div.innerHTML = msg;
-      warningBanner.appendChild(div);
-
-      if (type == 'error') {
-        div.style = 'background:red;padding:10px;';
-      } else {
-        if (type == 'warning') {
-          div.style = 'background:yellow;padding:10px;';
-        }
-        setTimeout(() => {
-          warningBanner.removeChild(div);
-          update();
-        }, 5000);
-      }
-
-      update();
-    }
-
-    const buildUrl = "Build";
-
-    const config = {
-      dataUrl: buildUrl + "/w-pt.data.unityweb",
-      frameworkUrl: buildUrl + "/w-pt.framework.js.unityweb",
-      codeUrl: buildUrl + "/w-pt.wasm.unityweb",
-      streamingAssetsUrl: "StreamingAssets",
-      companyName: "EDUrocks Group, Truffled, GN-Math",
-      productName: "Hollow Knight SilkSong",
-      productVersion: "1.0",
-      showBanner: unityShowBanner,
-    };
-
-    loadingBar.style.display = "block";
-
-    const script = document.createElement("script");
-    script.src = "https://cdn.jsdelivr.net/gh/web-ports/hollow-knight-silksong@latest/Build/w-pt.loader.js";
-
-    script.onload = () => {
-      createUnityInstance(canvas, config, (progress) => {
-        progressBarFull.style.width = (progress * 100) + "%";
-      })
-      .then(() => {
-        loadingBar.remove();
-        loadingText.remove();
-      })
-      .catch(alert);
-    };
-
-    document.body.appendChild(script);
-
+    startUnity();
   } catch (err) {
     console.error(err);
-    loadingText.textContent = "ERROR: " + err.message;
+    say("ERROR: " + err.message);
   }
 })();
 </script>
   </body>
 </html>
-
-
