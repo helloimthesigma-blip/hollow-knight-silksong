@@ -66,22 +66,19 @@ let cachePromise;
 const getCache = () => (cachePromise = cachePromise || caches.open(CACHE_NAME));
 
 /* ================= RUNTIME MEMORY TUNING =================
-   These rewrite two files as they are fetched rather than editing them in the
-   repo, because jsDelivr serves them with max-age=604800 - an edited copy
-   would not reach a browser that has already loaded the game for a week.
-   Changing them here also means they can be reverted by editing this page
-   alone, with no effect on the 2.3 GB of already-unpacked bundles. */
+   Applied by rewriting a response as it is fetched rather than editing the
+   file, because jsDelivr serves these with max-age=604800 and an edited copy
+   would not reach an existing install for a week. Doing it here also means it
+   can be undone by editing this page alone, leaving the unpacked bundles be.
 
-// Addressables loads this many asset bundles at once. The default of 3 means
-// up to three can be decompressed into the wasm heap simultaneously, and the
+   Add &tune=none to the URL to turn this off without a redeploy. */
+
+const TUNE = new URLSearchParams(location.search).get("tune") || "concurrency";
+
+// Addressables loads this many bundles at once. The default of 3 means up to
+// three can be decompressing into the wasm heap at the same time, and the
 // largest single bundle here is 481 MB.
 const MAX_CONCURRENT_BUNDLE_LOADS = 1;
-
-// Emscripten grows the heap to max(requested, oldSize * 1.2), so it overshoots
-// by 20% of the current heap on every growth - 200 MB once the heap is at 1 GB.
-// Tightening that trades more (cheap, in-place) growth steps for a lower peak.
-// Set to false if the game stops starting; nothing else depends on it.
-const TIGHTEN_HEAP_GROWTH = true;
 
 window.fetch = async function (resource, options) {
   const url = typeof resource === "string" ? resource : resource.url;
@@ -93,30 +90,21 @@ window.fetch = async function (resource, options) {
     if (hit) return hit;
   }
 
-  if (url && url.endsWith("settings.json")) {
+  if (TUNE === "concurrency" && url && url.endsWith("settings.json")) {
     const r = await originalFetch(resource, options);
     if (!r.ok) return r;
     const cfg = await r.json();
     cfg.m_maxConcurrentWebRequests = MAX_CONCURRENT_BUNDLE_LOADS;
+    const body = new TextEncoder().encode(JSON.stringify(cfg));
     console.log(`Addressables concurrency set to ${MAX_CONCURRENT_BUNDLE_LOADS}`);
-    return new Response(JSON.stringify(cfg),
-      { headers: { "content-type": "application/json" } });
-  }
-
-  if (TIGHTEN_HEAP_GROWTH && url && url.includes("framework.js")) {
-    const r = await originalFetch(resource, options);
-    if (!r.ok) return r;
-    const js = await r.text();
-    const patched = js
-      .replace("1 + .2 / cutDown", "1 + .05 / cutDown")
-      .replace("requestedSize + 536870912", "requestedSize + 67108864");
-    if (patched === js) {
-      console.warn("heap growth patch did not apply; running unmodified");
-      return new Response(js, { headers: { "content-type": "application/javascript" } });
-    }
-    console.log("heap growth tightened: 20% overshoot -> 5%, cap 512MB -> 64MB");
-    return new Response(patched,
-      { headers: { "content-type": "application/javascript" } });
+    // Unity reads Content-Length off these responses and stalls its progress
+    // accounting when it is missing, so set it rather than letting it default.
+    return new Response(body, {
+      headers: {
+        "content-type": "application/json",
+        "content-length": String(body.byteLength),
+      },
+    });
   }
 
   return originalFetch(resource, options);
