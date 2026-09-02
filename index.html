@@ -80,6 +80,19 @@ const TUNE = new URLSearchParams(location.search).get("tune") || "concurrency";
 // largest single bundle here is 481 MB.
 const MAX_CONCURRENT_BUNDLE_LOADS = 1;
 
+// Two builds of the same module, differing only in the heap they ask for up
+// front: 512 MB growing on demand, or 2688 MB allocated in one go.
+//
+// Growing a wasm heap can require the old and the new buffer to exist at the
+// same time, so stepping from 2.2 GB to 2.6 GB briefly needs ~4.8 GB even
+// though the game never uses more than ~2.5. On a machine that cannot spare
+// that, the crash lands on the growth step rather than on the actual usage.
+// Asking for the whole heap once avoids the doubling completely.
+//
+// &heap=pre selects it. Default is unchanged, since preallocating fails
+// outright on a machine that cannot hand over 2688 MB in a single request.
+const PREALLOCATE = new URLSearchParams(location.search).get("heap") === "pre";
+
 const LOADED_KEY = "silksong-bundles-loaded";
 const loadedBundles = [];
 
@@ -390,7 +403,7 @@ function startUnity() {
   const config = {
     dataUrl: buildUrl + "/w-pt.data.unityweb",
     frameworkUrl: buildUrl + "/w-pt.framework.js.unityweb?fwv=2",
-    codeUrl: buildUrl + "/w-pt.wasm.unityweb",
+    codeUrl: buildUrl + (PREALLOCATE ? "/w-pt.wasm.pre.unityweb" : "/w-pt.wasm.unityweb"),
     streamingAssetsUrl: "StreamingAssets",
     companyName: "EDUrocks Group, Truffled, GN-Math",
     productName: "Hollow Knight SilkSong",
