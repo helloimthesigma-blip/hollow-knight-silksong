@@ -80,6 +80,12 @@ const TUNE = new URLSearchParams(location.search).get("tune") || "concurrency";
 // largest single bundle here is 481 MB.
 const MAX_CONCURRENT_BUNDLE_LOADS = 1;
 
+// Heap growth overshoot as a percentage, two digits. The default 20% is what
+// took the heap to 512 * 1.2^8 = 2202 MB when the game had asked for somewhere
+// between 1835 and 2202.
+const GROWTH = (new URLSearchParams(location.search).get("growth") || "05")
+  .replace(/\D/g, "").padStart(2, "0").slice(0, 2);
+
 window.fetch = async function (resource, options) {
   const url = typeof resource === "string" ? resource : resource.url;
 
@@ -120,8 +126,12 @@ window.fetch = async function (resource, options) {
     const r = await originalFetch(resource, options);
     if (!r.ok) return r;
     const js = await r.text();
+    // &growth=02 overshoots by 2% instead of 5%; lower means less waste but
+    // more growth steps. ".0N" is one character longer than ".2" and the
+    // 67108864 cap is one shorter than 536870912, so the body length is
+    // unchanged and the original headers still describe it.
     const patched = js
-      .replace("1 + .2 / cutDown", "1 + .05 / cutDown")
+      .replace("1 + .2 / cutDown", `1 + .${GROWTH} / cutDown`)
       .replace("requestedSize + 536870912", "requestedSize + 67108864");
     if (patched === js || patched.length !== js.length) {
       console.warn("heap growth patch did not apply cleanly; running unmodified");
