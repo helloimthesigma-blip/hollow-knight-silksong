@@ -110,26 +110,50 @@ const SIG_CENTRAL = 0x02014b50;  // start of the central directory = end of data
 async function* archiveChunks(onPart, info) {
   for (let i = 1; i <= ZIP_PARTS; i++) {
     onPart(i);
-    let res = null, lastErr = "";
-    // cache: no-store keeps Chrome's HTTP cache out of it; on a machine low on
-    // disk it can hand back a truncated entry.
-    for (let attempt = 1; attempt <= 3 && !res; attempt++) {
+    let consumed = 0;   // bytes of this part already handed out
+
+    for (let attempt = 1; ; attempt++) {
+      let res = null, lastErr = "";
+      // cache: no-store keeps Chrome's HTTP cache out of it; on a machine low
+      // on disk it can hand back a truncated entry.
       try {
         const r = await originalFetch(`${ZIP_BASE}.part${i}`, { cache: "no-store" });
-        if (r.ok) res = r; else lastErr = `HTTP ${r.status}`;
         info.url = r.url;
         info.status = r.status;
         info.type = r.headers.get("content-type");
         info.length = r.headers.get("content-length");
-      } catch (e) { lastErr = e.message; }
-    }
-    if (!res) throw new Error(`part${i} failed after 3 tries: ${lastErr}`);
+        if (r.ok) res = r; else lastErr = `HTTP ${r.status}`;
+      } catch (e) {
+        lastErr = e.message;
+      }
 
-    const reader = res.body.getReader();
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      yield value;
+      if (res) {
+        try {
+          const reader = res.body.getReader();
+          let skip = consumed;    // on a retry, drop what was already yielded
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (skip >= value.length) { skip -= value.length; continue; }
+            const chunk = skip ? value.subarray(skip) : value;
+            skip = 0;
+            consumed += chunk.length;
+            yield chunk;
+          }
+          break;              // part delivered in full
+        } catch (e) {
+          // The connection dropped mid-part. Refetch and resume rather than
+          // failing the whole unpack - the stream feeds straight into
+          // Cache.put, which reports a broken body as a network error.
+          lastErr = e.message;
+          console.warn(`part${i} interrupted at byte ${consumed}, retrying`);
+        }
+      }
+
+      if (attempt >= 4) {
+        throw new Error(`part${i} failed after ${attempt} tries at byte ${consumed}: ${lastErr}`);
+      }
+      await new Promise(r => setTimeout(r, 500 * attempt));
     }
   }
 }
@@ -247,10 +271,22 @@ async function unpack() {
       ? raw.pipeThrough(new DecompressionStream("deflate-raw"))
       : raw).pipeThrough(counter);
 
-    if (canStreamPut) {
-      await cache.put(name, new Response(body));
-    } else {
-      await cache.put(name, new Response(await new Response(body).blob()));
+    try {
+      if (canStreamPut) {
+        await cache.put(name, new Response(body));
+      } else {
+        await cache.put(name, new Response(await new Response(body).blob()));
+      }
+    } catch (err) {
+      // Cache.put reports both a broken body and a full disk, so include the
+      // storage figures to tell them apart.
+      let where = "";
+      try {
+        const { usage, quota } = await navigator.storage.estimate();
+        where = `\nstorage ${(usage / 1073741824).toFixed(2)} GB used of ` +
+                `${(quota / 1073741824).toFixed(2)} GB available`;
+      } catch (e) { /* not reportable */ }
+      throw new Error(`${err.message}\nwhile writing ${name}${where}`);
     }
 
     count++;
